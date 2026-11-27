@@ -8,6 +8,7 @@
 """
 import asyncio
 import json
+import re
 import sys
 import time
 from datetime import datetime
@@ -23,6 +24,28 @@ PRICE_OUT_PER_M = 8.0
 
 DATASET = Path(__file__).parent / "dataset.json"
 OUT_DIR = Path(__file__).parent / "results"
+
+
+def resolve_checks(item: dict) -> list:
+    """把 answer_checks 解析为判分组：外层 AND、组内 OR（同义表达）。
+
+    兼容旧的 answer_keywords（每个词独立一组）。支持模板：
+      {date+N}    N 天后的日期，ISO 格式，如 2026-12-27
+      {date+N-zh} N 天后的日期，中文格式，如 12月27日
+    """
+    raw = item.get("answer_checks")
+    if raw is None:
+        raw = [[k] for k in item.get("answer_keywords", [])]
+    from datetime import datetime as _dt, timedelta as _td
+
+    def expand(kw: str) -> str:
+        m = re.fullmatch(r"\{date\+(\d+)(-zh)?\}", kw)
+        if not m:
+            return kw
+        d = _dt.now() + _td(days=int(m.group(1)))
+        return f"{d.month}月{d.day}日" if m.group(2) else d.strftime("%Y-%m-%d")
+
+    return [[expand(kw) for kw in group] for group in raw]
 
 
 async def run():
@@ -46,8 +69,14 @@ async def run():
                 prompt_tokens += res["usage"]["prompt"]
                 completion_tokens += res["usage"]["completion"]
             tool_ok = set(item.get("expected_tools", [])).issubset(set(called))
-            kw = item.get("answer_keywords", [])
-            kw_ok = all(k in reply for k in kw) if kw else True
+            checks = resolve_checks(item)
+            # 归一化匹配：空白不敏感、℃/°C 全半角等价
+            # 例：模型输出 "2026 年 12 月 27 日"、"9.8℃" 均不影响判分
+            norm = lambda s: "".join(s.split()).replace("℃", "°C")
+            reply_norm = norm(reply)
+            kw_ok = all(
+                any(norm(k) in reply_norm for k in group) for group in checks
+            ) if checks else True
             cost = prompt_tokens * PRICE_IN_PER_M / 1e6 + completion_tokens * PRICE_OUT_PER_M / 1e6
             records.append({
                 "id": item["id"], "category": item["category"],
